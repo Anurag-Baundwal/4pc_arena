@@ -49,6 +49,7 @@ NNUE_GAME_TERMINATIONS = {
     "game_result",
     "engine_reported_result",
     "no_legal_moves_result",
+    "no_legal_moves",
 }
 AUTO_NNUE_OUTPUT = "__auto_nnue_output__"
 
