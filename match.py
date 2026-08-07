@@ -672,7 +672,16 @@ class UciEngine:
                 line = raw.strip()
                 if not line:
                     continue
-                self._queue.put(line)
+                # Some 4PC builds print the final option line and uciok without
+                # an intervening newline. Split the sentinel so startup does not
+                # wait until the UCI handshake timeout expires.
+                if line != "uciok" and line.endswith("uciok"):
+                    option_line = line[: -len("uciok")].strip()
+                    if option_line:
+                        self._queue.put(option_line)
+                    self._queue.put("uciok")
+                else:
+                    self._queue.put(line)
         finally:
             self._queue.put(None)
 
