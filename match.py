@@ -1345,6 +1345,54 @@ def mate_score_result(info: dict[str, Any], team: str) -> str | None:
         return None
     return winner_for_failure(team) if value <= 0 else f"{team}_win"
 
+
+def determine_no_legal_moves_result(
+    searches: list[dict[str, Any]],
+    current_search: SearchResult,
+    current_team: str,
+) -> str:
+    """
+    Determines if a 'no legal moves' situation is Checkmate or Stalemate.
+    Checks ANY negative mate score on the current ply, or ANY positive mate
+    score on the previous ply.
+    """
+    # 1. Check current engine's search info on ply N
+    score = current_search.info.get("score")
+    if isinstance(score, dict) and score.get("type") == "mate":
+        try:
+            val = int(score["value"])
+            # val <= 0 means side to move is checkmated
+            if val <= 0:
+                return winner_for_failure(current_team)
+            else:
+                return f"{current_team}_win"
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Check opponent engine's search info on ply N-1
+    if searches:
+        prev_search = searches[-1]
+        prev_team = prev_search.get("team")
+        prev_score = prev_search.get("score")
+        if (
+            prev_team in {"ry", "bg"}
+            and isinstance(prev_score, dict)
+            and prev_score.get("type") == "mate"
+        ):
+            try:
+                val = int(prev_score["value"])
+                # val > 0 means previous engine announced checkmate
+                if val > 0:
+                    return f"{prev_team}_win"
+                else:
+                    return winner_for_failure(prev_team)
+            except (ValueError, TypeError):
+                pass
+
+    # 3. If neither engine reported a mate score, it is a genuine Stalemate (Draw)
+    return "draw"
+
+
 # Finalizes the mutable game record in one place so every termination includes
 # the same moves, score, and four-color clock snapshot.
 def finish_game(
@@ -1522,14 +1570,18 @@ def play_game(
                     moves, clocks, task.engine1_team
                 )
             if search.bestmove is None:
-                other_engine = bg_engine if engine is ry_engine else ry_engine
-                result = confirm_no_legal_moves(
-                    other_engine, moves, task.start.fen, search, team, config.timeout
-                )
+                result = determine_no_legal_moves_result(searches, search, team)
+                if result == "draw":
+                    other_engine = bg_engine if engine is ry_engine else ry_engine
+                    confirmed = confirm_no_legal_moves(
+                        other_engine, moves, task.start.fen, search, team, config.timeout
+                    )
+                    if confirmed in {"ry_win", "bg_win", "draw"}:
+                        result = confirmed
+
+                termination = "no_legal_moves_result" if result != "draw" else "no_legal_moves"
                 return finish_game(
-                    record, result or "draw",
-                    "no_legal_moves_result" if result else "no_legal_moves",
-                    moves, clocks, task.engine1_team
+                    record, result, termination, moves, clocks, task.engine1_team
                 )
             # Clock time belongs to the moving color, not to its two-color team.
             if config.limit_kind == "clock":
@@ -1684,11 +1736,7 @@ def sprt_info(summary: dict[str, Any]) -> str | None:
         if first or second:
             parts.append(f"[{label}: {first} / {second}]")
     terminations = summary["terminations"]
-    scalar_counts = (
-        ("No legal moves", "no_legal_moves"),
-        ("Max plies", "max_plies"),
-        ("Runner errors", "runner_error"),
-    )
+    scalar_counts = (("Runner errors", "runner_error"),)
     for label, key in scalar_counts:
         count = int(terminations.get(key, 0))
         if count:
@@ -1897,7 +1945,7 @@ def compact_training_record(record: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 # Renders position samples from the side-to-move team's perspective. Technical
-# and artificial endings are excluded because they are unreliable game labels.
+# endings are excluded because they are unreliable game labels.
 def nnue_lines(record: dict[str, Any]) -> list[str]:
     if record.get("termination") not in NNUE_GAME_TERMINATIONS:
         return []
@@ -3229,3 +3277,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+    
