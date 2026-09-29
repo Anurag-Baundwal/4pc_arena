@@ -42,6 +42,7 @@ class Coordinator:
         if fresh:
             if out_path:
                 out_path.unlink(missing_ok=True)
+                match.sidecar(out_path, ".summary.json").unlink(missing_ok=True)
             if schedule_path:
                 schedule_path.unlink(missing_ok=True)
 
@@ -52,10 +53,14 @@ class Coordinator:
         self.in_flight: dict[int, float] = {}  # pair_idx -> assigned_timestamp
         self.completed_pairs: set[int] = set()
 
-        self.sprt = match.PentanomialSprt(config.sprt) if config.sprt else None
         self.summary = match.SummaryAccumulator(
             pairs_total * 2, paired=True, sprt=config.sprt
         )
+        self.sprt = self.summary.sprt
+
+        # Resume: Read existing games from JSONL if not --fresh
+        if not fresh and out_path and out_path.is_file():
+            self._resume_existing(out_path)
 
     def _load_or_create_schedule(
         self,
@@ -105,6 +110,59 @@ class Coordinator:
                     )
         return schedule
 
+    def _resume_existing(self, path: Path) -> None:
+        records: list[dict[str, Any]] = []
+        pair_counts: dict[int, int] = {}
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    records.append(rec)
+                    p_idx = rec.get("pair") or rec.get("game")
+                    if p_idx is not None:
+                        p_idx = int(p_idx)
+                        pair_counts[p_idx] = pair_counts.get(p_idx, 0) + 1
+                except Exception:
+                    continue
+
+        # A pair is complete only if both games (Game 1 & Game 2) are present
+        for p_idx, count in pair_counts.items():
+            if count >= 2:
+                self.completed_pairs.add(p_idx)
+
+        pair_added_count: dict[int, int] = {}
+        for rec in records:
+            p_idx = rec.get("pair") or rec.get("game")
+            if p_idx is not None:
+                p_idx = int(p_idx)
+                if p_idx in self.completed_pairs and pair_added_count.get(p_idx, 0) < 2:
+                    self.summary.add(rec)
+                    pair_added_count[p_idx] = pair_added_count.get(p_idx, 0) + 1
+
+        # Fast-forward next_index to the first incomplete pair
+        while self.next_index <= self.pairs_total and self.next_index in self.completed_pairs:
+            self.next_index += 1
+
+        if self.completed_pairs:
+            print(
+                f"\n[Resume] Successfully restored {len(self.completed_pairs)} pairs "
+                f"({self.summary.games_completed} games).",
+                flush=True,
+            )
+            print(f"[Resume] Next pair to play: Pair {self.next_index:04d}\n", flush=True)
+            stats_snapshot = self.summary.summary()
+            if self.config.sprt:
+                match.print_sprt_report(stats_snapshot, self.config)
+            else:
+                match.print_summary(stats_snapshot, "Engine1", "Engine2")
+
+            summary_path = match.sidecar(self.out_path, ".summary.json") if self.out_path else None
+            if summary_path:
+                match.atomic_json(summary_path, stats_snapshot)
+
     def is_finished(self) -> bool:
         if self.sprt and self.sprt.terminal:
             return True
@@ -121,13 +179,19 @@ class Coordinator:
 
             # 1. Check for expired leases (orphaned by disconnected/crashed devices)
             for pair_idx, assigned_at in list(self.in_flight.items()):
+                if pair_idx in self.completed_pairs:
+                    self.in_flight.pop(pair_idx, None)
+                    continue
                 if now - assigned_at > self.lease_timeout:
                     print(f"[*] Pair {pair_idx:04d} lease expired. Reassigning.", flush=True)
                     assigned_pair = pair_idx
                     self.in_flight[pair_idx] = now
                     break
 
-            # 2. Pick next unassigned pair
+            # 2. Pick next unassigned pair (skipping any already completed)
+            while self.next_index <= self.pairs_total and self.next_index in self.completed_pairs:
+                self.next_index += 1
+
             if assigned_pair is None and self.next_index <= self.pairs_total:
                 assigned_pair = self.next_index
                 self.next_index += 1
@@ -173,6 +237,10 @@ class Coordinator:
                 match.print_sprt_report(stats_snapshot, self.config)
             else:
                 match.print_summary(stats_snapshot, "Engine1", "Engine2")
+
+            summary_path = match.sidecar(self.out_path, ".summary.json") if self.out_path else None
+            if summary_path:
+                match.atomic_json(summary_path, stats_snapshot)
 
             return {"ok": True, "stop": self.is_finished()}
 
