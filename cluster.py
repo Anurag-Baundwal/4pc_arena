@@ -330,12 +330,30 @@ def run_server(args: argparse.Namespace) -> None:
     print(f"[Coordinator] SPRT: [{args.sprt_elo0}, {args.sprt_elo1}] max {args.pairs} pairs.")
     print("Press Ctrl+C to shut down.\n", flush=True)
 
+    # Monitor SPRT completion in the background and gracefully terminate server
+    def watch_completion() -> None:
+        while not coordinator.is_finished():
+            time.sleep(1)
+
+        # Allow a short grace period for active in-flight submissions to land
+        time.sleep(2)
+
+        state = coordinator.sprt.state.upper() if coordinator.sprt else "FINISHED"
+        print(f"\n==============================================", flush=True)
+        print(f"[*] SPRT COMPLETE: {state}!", flush=True)
+        print(f"==============================================\n", flush=True)
+        server.shutdown()
+
+    watcher = threading.Thread(target=watch_completion, daemon=True)
+    watcher.start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down coordinator...", flush=True)
     finally:
         server.server_close()
+        print("[Coordinator] Stopped cleanly.", flush=True)
 
 
 def http_get(url: str) -> dict[str, Any]:
@@ -353,6 +371,7 @@ def http_post(url: str, data: dict[str, Any]) -> dict[str, Any]:
     )
     with urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
 
 def format_pair_result(s1: float, s2: float) -> str:
     tags = {1.0: "Win", 0.5: "Draw", 0.0: "Loss"}
@@ -401,13 +420,17 @@ def worker_thread(
                 task_data["source"],
             )
 
-            # Play Game 1: Engine 1 on RY, Engine 2 on BG
-            task1 = match.GameTask(pair_index, "ry", start, paired=True)
-            rec1 = match.play_game(config, task1, stop_event, active_engines, reusable)
+            # Play pair games, cleanly stopping if another worker triggers a match stop
+            try:
+                # Play Game 1: Engine 1 on RY, Engine 2 on BG
+                task1 = match.GameTask(pair_index, "ry", start, paired=True)
+                rec1 = match.play_game(config, task1, stop_event, active_engines, reusable)
 
-            # Play Game 2: Engine 1 on BG, Engine 2 on RY
-            task2 = match.GameTask(pair_index, "bg", start, paired=True)
-            rec2 = match.play_game(config, task2, stop_event, active_engines, reusable)
+                # Play Game 2: Engine 1 on BG, Engine 2 on RY
+                task2 = match.GameTask(pair_index, "bg", start, paired=True)
+                rec2 = match.play_game(config, task2, stop_event, active_engines, reusable)
+            except match.MatchInterrupted:
+                break
 
             # Post results back to coordinator
             try:
@@ -429,6 +452,8 @@ def worker_thread(
                     break
             except (URLError, TimeoutError, OSError) as e:
                 print(f"[Worker {worker_id}] Warning submitting result: {e}", file=sys.stderr)
+    except match.MatchInterrupted:
+        pass
     finally:
         if reusable:
             reusable.close()
