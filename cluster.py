@@ -421,6 +421,7 @@ def worker_thread(
             )
 
             # Play pair games, cleanly stopping if another worker triggers a match stop
+            # or if Ctrl+C kills engine subprocesses on Windows
             try:
                 # Play Game 1: Engine 1 on RY, Engine 2 on BG
                 task1 = match.GameTask(pair_index, "ry", start, paired=True)
@@ -429,7 +430,7 @@ def worker_thread(
                 # Play Game 2: Engine 1 on BG, Engine 2 on RY
                 task2 = match.GameTask(pair_index, "bg", start, paired=True)
                 rec2 = match.play_game(config, task2, stop_event, active_engines, reusable)
-            except match.MatchInterrupted:
+            except (match.MatchInterrupted, match.EngineError):
                 break
 
             # Post results back to coordinator
@@ -452,7 +453,7 @@ def worker_thread(
                     break
             except (URLError, TimeoutError, OSError) as e:
                 print(f"[Worker {worker_id}] Warning submitting result: {e}", file=sys.stderr)
-    except match.MatchInterrupted:
+    except (match.MatchInterrupted, match.EngineError):
         pass
     finally:
         if reusable:
