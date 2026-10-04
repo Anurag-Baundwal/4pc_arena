@@ -31,11 +31,13 @@ class Coordinator:
         schedule_path: Path | None,
         lease_timeout_sec: float = 300.0,
         fresh: bool = False,
+        no_early_stop: bool = False, 
     ) -> None:
         self.config = config
         self.pairs_total = pairs_total
         self.out_path = out_path
         self.lease_timeout = lease_timeout_sec
+        self.no_early_stop = no_early_stop
         self.lock = threading.Lock()
 
         # Handle --fresh cleanup
@@ -164,7 +166,7 @@ class Coordinator:
                 match.atomic_json(summary_path, stats_snapshot)
 
     def is_finished(self) -> bool:
-        if self.sprt and self.sprt.terminal:
+        if not self.no_early_stop and self.sprt and self.sprt.terminal:
             return True
         return len(self.completed_pairs) >= self.pairs_total
 
@@ -322,6 +324,7 @@ def run_server(args: argparse.Namespace) -> None:
         schedule_path,
         lease_timeout_sec=args.lease_timeout,
         fresh=args.fresh,
+        no_early_stop=args.no_early_stop,
     )
     ClusterServerHandler.coordinator = coordinator
 
@@ -539,6 +542,11 @@ def main() -> None:
     s_parser.add_argument("--sprt-elo1", type=float, default=5.0)
     s_parser.add_argument("--sprt-alpha", type=float, default=0.05)
     s_parser.add_argument("--sprt-beta", type=float, default=0.05)
+    s_parser.add_argument(
+        "--no-early-stop",
+        action="store_true",
+        help="Do not stop early when SPRT bounds are reached; play all scheduled pairs",
+    )
     s_parser.add_argument("--nodes", type=int, default=10000)
     s_parser.add_argument("--tc", type=int, default=0)
     s_parser.add_argument("--inc", type=int, default=0)
