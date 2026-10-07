@@ -134,6 +134,7 @@ class MatchConfig:
     nnue_output: bool = False
     sprt: SprtConfig | None = None
     nnue_opening_fallback: bool = False
+    fens_start: int = 0
 
 # Captures the final response to one UCI search, including protocol-level game
 # completion or position-rejection details when no move is returned.
@@ -1101,11 +1102,14 @@ def load_fens(path: str) -> list[str]:
     return fens
 
 # Yields deterministic shuffled cycles. A FEN appears at most once per cycle,
-# avoiding the clumping caused by independent random choice.
+# avoiding the clumping caused by independent random choice. The cycles form
+# one stream per seed, and start selects a position within that stream, so
+# disjoint start ranges (e.g. separate OpenBench workloads) get disjoint FENs.
 def shuffled_fens(
     fens: list[str],
     entries: int,
     seed: int,
+    start: int = 0,
 ) -> Iterator[str | None]:
     if not fens:
         for _ in range(entries):
@@ -1114,12 +1118,17 @@ def shuffled_fens(
 
     rng = random.Random(f"{seed}:fens")
     cycle = list(fens)
+    skipped_cycles, offset = divmod(start, len(cycle))
+    for _ in range(skipped_cycles):
+        rng.shuffle(cycle)
+
     remaining = entries
     while remaining > 0:
         rng.shuffle(cycle)
-        cycle_size = min(remaining, len(cycle))
-        yield from cycle[:cycle_size]
-        remaining -= cycle_size
+        chunk = cycle[offset : offset + remaining]
+        offset = 0
+        yield from chunk
+        remaining -= len(chunk)
 
 # Returns the starting color index encoded by a four-player FEN. Startpos and
 # malformed turn fields conservatively fall back to Red.
@@ -1715,6 +1724,24 @@ def live_event(record: dict[str, Any], name1: str, name2: str) -> str:
         return f" [Runner error: {record.get('error', 'unknown error')}]"
     return ""
 
+# Formats a fastchess-style completion line for runners that parse results
+# from stdout, such as the OpenBench client. Paired games are numbered 2N-1
+# (Engine 1 as Red/Yellow) and 2N (Engine 2 as Red/Yellow) for pair N, and the
+# result is from the perspective of the engine listed first.
+def finished_game_line(record: dict[str, Any], name1: str, name2: str) -> str:
+    index = record_index(record)
+    score = float(record.get("engine1_score", 0.5))
+    termination = record.get("termination", "unknown")
+    engine1_first = record.get("engine1_team") == "ry"
+    if record.get("paired", True):
+        number = 2 * index - 1 if engine1_first else 2 * index
+    else:
+        number = index
+    first_score = score if engine1_first else 1.0 - score
+    result = "1-0" if first_score == 1.0 else "0-1" if first_score == 0.0 else "1/2-1/2"
+    first, second = (name1, name2) if engine1_first else (name2, name1)
+    return f"Finished game {number} ({first} vs {second}): {result} {{{termination}}}"
+
 # Prints cumulative WDL, score, and Elo after one completed game.
 def print_summary(
     summary: dict[str, Any],
@@ -2261,7 +2288,7 @@ def create_schedule(
             for item in raw
         ]
     rng = random.Random(seed)
-    fens = shuffled_fens(config.fens, entries, seed)
+    fens = shuffled_fens(config.fens, entries, seed, config.fens_start)
     if config.opening_plies:
         starts = []
         with contextlib.ExitStack() as stack:
@@ -2310,7 +2337,7 @@ def iter_persistent_schedule(
     rules: UciEngine | None = None
     existing_exhausted = existing is None
     try:
-        scheduled_fens = shuffled_fens(config.fens, entries, seed)
+        scheduled_fens = shuffled_fens(config.fens, entries, seed, config.fens_start)
         for index, fen in enumerate(scheduled_fens, 1):
             raw = (
                 existing.readline()
@@ -2724,6 +2751,7 @@ def run_match(args: argparse.Namespace) -> int:
                         nnue_output=nnue_output is not None,
                         sprt=args.sprt_config,
                         nnue_opening_fallback=bool(args.nnue_data_seeds),
+                        fens_start=args.fens_start,
     )
     validate_sprt_config(config, continue_on_error=args.continue_on_error)
     if arbiter is not None:
@@ -2774,6 +2802,9 @@ def run_match(args: argparse.Namespace) -> int:
     if not args.paired:
         payload["mode"] = "unpaired"
         payload["games"] = args.game_count
+    # Omitted at its default so existing runs keep their resume fingerprint.
+    if config.fens_start:
+        payload["fens_start"] = config.fens_start
     if config.sprt is not None:
         payload["sprt"] = {
             "model": "normalized",
@@ -2930,6 +2961,8 @@ def run_match(args: argparse.Namespace) -> int:
             append_jsonl(out, persisted)
         if nnue_output is not None:
             append_nnue(nnue_output, record)
+        if not args.quiet:
+            print(finished_game_line(record, name1, name2), flush=True)
         pairs_before = stats.pairs_completed
         stats.add(record)
         completed_pair = stats.pairs_completed > pairs_before
@@ -3177,6 +3210,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum attempts to generate a balanced guided opening",
     )
     parser.add_argument("--fens", default="", help="opening FEN file")
+    parser.add_argument("--fens-start", type=int, default=0, help="starting index in opening FEN schedule")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
         "--nnue-data-seeds",
@@ -3332,6 +3366,8 @@ def main() -> int:
         parser.error("--opening-max-score must be at least 0")
     if args.opening_attempts < 1:
         parser.error("--opening-attempts must be at least 1")
+    if args.fens_start < 0:
+        parser.error("--fens-start must be at least 0")
     if args.training_output and not (args.out or args.nnue_data_seeds):
         parser.error("--compact-output requires --out")
     if args.pgn4_single_line and not args.pgn4:
